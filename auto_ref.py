@@ -18,6 +18,7 @@ import argparse
 import logging
 import sys
 import re
+import time
 from abc import ABC, abstractmethod
 from typing import List, Optional
 import requests
@@ -44,44 +45,202 @@ class DblpEngine(BaseBibtexEngine):
         super().__init__()
         self.api_url = "https://dblp.org/search/publ/api"
         self.skip_preprint = skip_preprint
+        self.timeout = 20  # Increased from 10s to accommodate network latency
+        self.max_retries = 2  # Retry up to 2 times on transient failures
+        self.retry_delay = 1.5  # Wait 1.5s between retries with exponential backoff
 
     def fetch_bibtex(self, title: str) -> Optional[str]:
-        logging.info(f"Retrieving via DBLP engine: {title}")
+        logging.info(f"[DBLP] Querying for: {title}")
         params = {"q": title, "format": "json", "h": 5}
 
-        try:
-            response = self.session.get(self.api_url, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self.session.get(self.api_url, params=params, timeout=self.timeout)
+                response.raise_for_status()
+                data = response.json()
 
-            hits = data.get("result", {}).get("hits", {}).get("hit", [])
-            if not hits:
-                logging.warning(f"DBLP matched no results for {title}")
+                hits = data.get("result", {}).get("hits", {}).get("hit", [])
+                if not hits:
+                    logging.debug(f"[DBLP] No results found for: {title}")
+                    return None
+
+                for index, hit in enumerate(hits):
+                    info = hit.get("info", {})
+                    venue = info.get("venue", "")
+                    key = info.get("key")
+
+                    if self.skip_preprint:
+                        if "CoRR" in venue or "arXiv" in venue.lower():
+                            logging.debug(f"[DBLP] Skipping preprint entry (Venue: {venue})")
+                            continue
+
+                    if key:
+                        bib_url = f"https://dblp.org/rec/{key}.bib"
+                        logging.debug(f"[DBLP] Found entry (Venue: {venue}), downloading BibTeX...")
+                        
+                        # Retry logic for BibTeX download
+                        bib_response = None
+                        for bib_attempt in range(2):
+                            try:
+                                bib_response = self.session.get(bib_url, timeout=self.timeout)
+                                if bib_response.status_code == 200:
+                                    logging.info(f"[DBLP] Successfully retrieved BibTeX from: {venue}")
+                                    return bib_response.text.strip()
+                            except requests.RequestException:
+                                if bib_attempt == 0:
+                                    time.sleep(self.retry_delay)
+                                    continue
+                                else:
+                                    break
+
+                logging.debug(f"[DBLP] Found entries but none matched preprint filter criteria")
                 return None
 
-            for index, hit in enumerate(hits):
-                info = hit.get("info", {})
-                venue = info.get("venue", "")
-                key = info.get("key")
+            except requests.Timeout:
+                if attempt < self.max_retries:
+                    wait_time = self.retry_delay * (attempt + 1)
+                    logging.warning(f"[DBLP] Timeout (attempt {attempt + 1}/{self.max_retries + 1}), retrying in {wait_time}s")
+                    time.sleep(wait_time)
+                else:
+                    logging.error(f"[DBLP] Failed after {self.max_retries + 1} attempts: Request timeout")
+                    return None
+            except requests.ConnectionError:
+                if attempt < self.max_retries:
+                    wait_time = self.retry_delay * (attempt + 1)
+                    logging.warning(f"[DBLP] Connection error (attempt {attempt + 1}/{self.max_retries + 1}), retrying in {wait_time}s")
+                    time.sleep(wait_time)
+                else:
+                    logging.error(f"[DBLP] Failed after {self.max_retries + 1} attempts: Connection error")
+                    return None
+            except requests.RequestException as e:
+                logging.error(f"[DBLP] Request failed: {type(e).__name__}")
+                return None
 
+        return None
+    
+class SemanticScholarEngine(BaseBibtexEngine):
+    """Semantic Scholar retrieval engine.
+    
+    Covers extensive multidisciplinary literature with excellent support for AI and related fields.
+    Official API natively supports BibTeX format return.
+    """
+    def __init__(self, skip_preprint: bool = True):
+        super().__init__()
+        self.api_url = "https://api.semanticscholar.org/graph/v1/paper/search"
+        self.skip_preprint = skip_preprint
+        self.timeout = 20
+
+    def fetch_bibtex(self, title: str) -> Optional[str]:
+        logging.info(f"[SemanticScholar] Querying for: {title}")
+        # Request fields: venue (journal/conference), publicationTypes (paper type), citationStyles (BibTeX format)
+        params = {
+            "query": title,
+            "limit": 3,
+            "fields": "title,venue,publicationTypes,citationStyles"
+        }
+        
+        try:
+            response = self.session.get(self.api_url, params=params, timeout=self.timeout)
+            response.raise_for_status()
+            data = response.json()
+            
+            hits = data.get("data", [])
+            if not hits:
+                logging.debug(f"[SemanticScholar] No results found for: {title}")
+                return None
+                
+            for hit in hits:
+                venue = hit.get("venue", "")
+                pub_types = hit.get("publicationTypes") or []
+                
                 if self.skip_preprint:
-                    if "CoRR" in venue or "arXiv" in venue.lower():
-                        logging.info(f"Automatically skipping preprint version (Venue: {venue})")
+                    # Filter out arXiv and Review (preprint review stage) entries
+                    if "arxiv" in venue.lower() or "corr" in venue.lower() or "Review" in pub_types:
+                        logging.debug(f"[SemanticScholar] Skipping preprint entry (Venue: {venue})")
                         continue
-
-                if key:
-                    bib_url = f"https://dblp.org/rec/{key}.bib"
-                    logging.info(f"Found target version (Venue: {venue}), downloading BibTeX...")
-                    bib_response = self.session.get(bib_url, timeout=10)
-
-                    if bib_response.status_code == 200:
-                        return bib_response.text.strip()
-
-            logging.warning(f"DBLP found entries but none matched filtering criteria for {title}")
+                
+                bibtex = hit.get("citationStyles", {}).get("bibtex")
+                if bibtex:
+                    logging.info(f"[SemanticScholar] Successfully retrieved BibTeX (Venue: {venue})")
+                    return bibtex.strip()
+                    
             return None
-
+        except requests.Timeout:
+            logging.warning(f"[SemanticScholar] Request timeout for: {title}")
+            return None
         except requests.RequestException as e:
-            logging.error(f"DBLP engine request failed: {str(e)}")
+            logging.debug(f"[SemanticScholar] Request error: {type(e).__name__}")
+            return None
+        except Exception as e:
+            logging.error(f"[SemanticScholar] Unexpected error: {e}")
+            return None
+        
+class CrossRefEngine(BaseBibtexEngine):
+    """CrossRef retrieval engine.
+    
+    Most powerful multidisciplinary fallback engine. If a paper has an assigned DOI, it can be found here.
+    Uses doi.org content negotiation to retrieve authentic BibTeX format directly.
+    """
+    def __init__(self, skip_preprint: bool = True):
+        super().__init__()
+        self.search_url = "https://api.crossref.org/works"
+        self.skip_preprint = skip_preprint
+        self.timeout = 20
+        # CrossRef strongly recommends including email in User-Agent to get allocated to faster "Polite Pool"
+        self.session.headers.update({
+            "User-Agent": "AutoRef_Bot/1.0 (mailto:developer@example.com)"
+        })
+
+    def fetch_bibtex(self, title: str) -> Optional[str]:
+        logging.info(f"[CrossRef] Querying for: {title}")
+        params = {
+            "query.bibliographic": title,
+            "select": "DOI,title,type,container-title",
+            "rows": 3
+        }
+        
+        try:
+            response = self.session.get(self.search_url, params=params, timeout=self.timeout)
+            response.raise_for_status()
+            data = response.json()
+            
+            items = data.get("message", {}).get("items", [])
+            if not items:
+                logging.debug(f"[CrossRef] No results found for: {title}")
+                return None
+                
+            for item in items:
+                pub_type = item.get("type", "")
+                venue = item.get("container-title", [""])[0] if item.get("container-title") else ""
+                doi = item.get("DOI")
+                
+                if self.skip_preprint:
+                    # CrossRef strictly marks preprints with 'posted-content' type
+                    if pub_type == "posted-content":
+                        logging.debug(f"[CrossRef] Skipping preprint entry (Type: {pub_type})")
+                        continue
+                        
+                if doi:
+                    logging.debug(f"[CrossRef] Found DOI: {doi}, negotiating BibTeX format...")
+                    # Use HTTP Accept header to request BibTeX format from doi.org
+                    bib_response = self.session.get(
+                        f"https://doi.org/{doi}", 
+                        headers={"Accept": "application/x-bibtex"},
+                        timeout=self.timeout
+                    )
+                    if bib_response.status_code == 200:
+                        logging.info(f"[CrossRef] Successfully retrieved BibTeX from DOI: {doi}")
+                        return bib_response.text.strip()
+                        
+            return None
+        except requests.Timeout:
+            logging.warning(f"[CrossRef] Request timeout for: {title}")
+            return None
+        except requests.RequestException as e:
+            logging.debug(f"[CrossRef] Request error: {type(e).__name__}")
+            return None
+        except Exception as e:
+            logging.error(f"[CrossRef] Unexpected error: {e}")
             return None
 
 class BibtexManager:
@@ -245,22 +404,25 @@ class BibtexManager:
 
     def get_bibtex(self, title: str) -> Optional[str]:
         if not self._engines:
-            logging.error("No retrieval engines registered in manager")
+            logging.error("[Manager] No retrieval engines registered")
             return None
 
-        for engine in self._engines:
+        engines_attempted = []
+        for i, engine in enumerate(self._engines, 1):
             try:
+                engine_name = engine.__class__.__name__
                 result = engine.fetch_bibtex(title)
                 if result:
-                    logging.info("Successfully retrieved BibTeX data")
+                    logging.info(f"[Manager] Retrieved BibTeX via {engine_name} ({i}/{len(self._engines)})")
                     # Clean and format BibTeX
                     result = self._clean_and_format_bibtex(result)
                     return result
+                engines_attempted.append(engine_name)
             except Exception as e:
-                logging.error(f"Engine internal error: {e}")
+                logging.error(f"[Manager] {engine.__class__.__name__} error: {e}")
                 continue
 
-        logging.error(f"No engine could retrieve matching BibTeX for {title}")
+        logging.warning(f"[Manager] All {len(self._engines)} engines failed for: {title}")
         return None
 
 # ==========================================
@@ -277,7 +439,7 @@ def setup_logging(verbose: bool):
     )
 
 def main():
-    # 1. Define command-line arguments
+    # Define command-line arguments
     parser = argparse.ArgumentParser(
         description="Academic paper BibTeX retrieval CLI tool (based on DBLP and other open APIs)",
         formatter_class=argparse.RawTextHelpFormatter
@@ -318,19 +480,25 @@ def main():
 
     args = parser.parse_args()
 
-    # 2. Validate arguments
+    # Validate arguments
     if not args.title and not args.file:
         parser.print_help()
         sys.exit(1)
 
-    # 3. Initialize environment
+    # Initialize environment
     setup_logging(args.verbose)
     
     manager = BibtexManager()
-    dblp_engine = DblpEngine(skip_preprint=not args.allow_preprint)
-    manager.register_engine(dblp_engine)
+    
+    # Determine preprint filtering based on command-line arguments
+    skip_prep = not args.allow_preprint
+    
+    # Register engines (order defines priority for fallback)
+    manager.register_engine(DblpEngine(skip_preprint=skip_prep))
+    manager.register_engine(SemanticScholarEngine(skip_preprint=skip_prep))
+    manager.register_engine(CrossRefEngine(skip_preprint=skip_prep))
 
-    # 4. Process single title or file mode
+    # Process single title or file mode
     if args.file:
         # Batch processing mode
         process_titles_from_file(manager, args.file, args.output, args.verbose)
@@ -339,7 +507,8 @@ def main():
         process_single_title(manager, args.title, args.output)
 
 def process_single_title(manager: BibtexManager, title: str, output_file: Optional[str]) -> None:
-    """Process a single paper title"""
+    """Process a single paper title and output result"""
+    logging.info(f"[CLI] Processing single title: {title}")
     bibtex_data = manager.get_bibtex(title)
 
     if bibtex_data:
@@ -347,27 +516,33 @@ def process_single_title(manager: BibtexManager, title: str, output_file: Option
             try:
                 with open(output_file, "a", encoding="utf-8") as f:
                     f.write(bibtex_data + "\n\n")
-                print(f"Success. BibTeX appended to: {output_file}")
+                print(f"[SUCCESS] BibTeX appended to: {output_file}")
+                logging.info(f"[CLI] Successfully saved to file: {output_file}")
             except IOError as e:
-                print(f"File write failed: {e}", file=sys.stderr)
+                print(f"[ERROR] File write failed: {e}", file=sys.stderr)
+                logging.error(f"[CLI] Failed to write file {output_file}: {e}")
         else:
-            print("\n" + "-"*40)
+            print("\n" + "="*50)
             print(bibtex_data)
-            print("-"*40 + "\n")
+            print("="*50 + "\n")
+            logging.info(f"[CLI] Successfully printed BibTeX to stdout")
     else:
+        print("[ERROR] Failed to retrieve BibTeX for the given title", file=sys.stderr)
         sys.exit(1)
 
 def process_titles_from_file(manager: BibtexManager, file_path: str, output_file: Optional[str], verbose: bool) -> None:
-    """Read titles from file line by line and retrieve BibTeX in batch"""
+    """Read titles from file line by line and retrieve BibTeX in batch mode"""
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
             titles = [line.strip() for line in f if line.strip()]
     except IOError as e:
-        print(f"File read failed: {e}", file=sys.stderr)
+        print(f"[ERROR] File read failed: {e}", file=sys.stderr)
+        logging.error(f"[CLI] Failed to read file {file_path}: {e}")
         sys.exit(1)
 
     if not titles:
-        print("No titles found in file", file=sys.stderr)
+        print("[ERROR] No titles found in file", file=sys.stderr)
+        logging.error(f"[CLI] File {file_path} contains no valid titles")
         sys.exit(1)
 
     # Determine output file (default to ref.bib if not specified)
@@ -378,43 +553,54 @@ def process_titles_from_file(manager: BibtexManager, file_path: str, output_file
     try:
         open(output_file, 'w', encoding='utf-8').close()
     except IOError as e:
-        print(f"Cannot create output file {output_file}: {e}", file=sys.stderr)
+        print(f"[ERROR] Cannot create output file {output_file}: {e}", file=sys.stderr)
+        logging.error(f"[CLI] Failed to create output file {output_file}: {e}")
         sys.exit(1)
 
-    print(f"Found {len(titles)} titles, starting batch retrieval...")
+    print(f"[INFO] Found {len(titles)} titles, starting batch retrieval...")
+    logging.info(f"[CLI] Starting batch processing of {len(titles)} titles")
     success_count = 0
     failed_titles = []
 
     for idx, title in enumerate(titles, 1):
-        print(f"\n[{idx}/{len(titles)}] Retrieving: {title[:60]}{'...' if len(title) > 60 else ''}")
+        print(f"\n[{idx}/{len(titles)}] Retrieving: {title[:70]}{'...' if len(title) > 70 else ''}")
         bibtex_data = manager.get_bibtex(title)
         
         if bibtex_data:
             try:
                 with open(output_file, 'a', encoding='utf-8') as f:
                     f.write(bibtex_data + "\n\n")
-                print(f"  Successfully retrieved")
+                print(f"  [OK] Successfully retrieved")
                 success_count += 1
             except IOError as e:
-                print(f"  File write failed: {e}", file=sys.stderr)
+                print(f"  [ERROR] File write failed: {e}", file=sys.stderr)
+                logging.error(f"[CLI] Failed to write BibTeX for title {idx}: {e}")
                 failed_titles.append((title, f"Write error: {e}"))
         else:
-            print(f"  BibTeX not found")
+            print(f"  [SKIP] No BibTeX found")
             failed_titles.append((title, "Not found"))
+        
+        # Add delay between requests to respect API rate limits (except after last request)
+        if idx < len(titles):
+            time.sleep(0.5)
 
     # Output statistics
     print(f"\n{'='*50}")
-    print(f"Retrieval completed")
-    print(f"Success: {success_count}/{len(titles)}")
-    print(f"Failed: {len(failed_titles)}/{len(titles)}")
+    print(f"[SUMMARY] Batch retrieval completed")
+    print(f"[SUMMARY] Success: {success_count}/{len(titles)}")
+    print(f"[SUMMARY] Failed: {len(failed_titles)}/{len(titles)}")
     
     if failed_titles:
-        print(f"\nFailed titles:")
+        print(f"\n[INFO] Failed titles:")
         for title, reason in failed_titles:
-            print(f"  - {title[:60]}{'...' if len(title) > 60 else ''} ({reason})")
+            print(f"  - {title[:70]}{'...' if len(title) > 70 else ''} ({reason})")
     
     if success_count > 0:
-        print(f"\nAll BibTeX entries saved to: {output_file}")
+        print(f"\n[SUCCESS] All BibTeX entries saved to: {output_file}")
+        logging.info(f"[CLI] Batch processing completed: {success_count}/{len(titles)} successful")
+    else:
+        print(f"\n[WARNING] No BibTeX entries could be retrieved")
+        logging.warning(f"[CLI] Batch processing failed: 0/{len(titles)} successful")
 
 if __name__ == "__main__":
     main()
